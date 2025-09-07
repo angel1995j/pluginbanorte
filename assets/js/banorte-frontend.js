@@ -1,132 +1,169 @@
-(function($){
+(function(){
+  'use strict';
+
+  var MAX_WAIT_MS = 60000;
+
   function log(){ try{ console.log.apply(console, ['[VCE]'].concat([].slice.call(arguments))); }catch(e){} }
+  function err(){ try{ console.error.apply(console, ['[VCE]'].concat([].slice.call(arguments))); }catch(e){} }
 
-  // Inyecta script si no está o si fue removido, y espera a Payment.startPayment
-  function ensurePaymentReady(timeoutMs){
-    timeoutMs = timeoutMs || 12000;
+  function hasPayment(){ return !!window.Payment; }
+  function hasAuth(){ return !!(window.Payment && typeof window.Payment.authenticateV2 === 'function'); }
+  function hasStart(){ return !!(window.Payment && (typeof window.Payment.startPaymentV2 === 'function' || typeof window.Payment.startPayment === 'function' || typeof window.Payment.configure === 'function')); }
+
+  function waitUntil(checkFn, timeoutMs, label){
+    var started = Date.now();
     return new Promise(function(resolve, reject){
-      var start = Date.now();
-      var injected = false;
-
-      function ready(){
-        return (window.Payment && typeof window.Payment.startPayment === 'function');
-      }
-
-      function inject(){
-        var existing = document.getElementById('banorte-lightbox');
-        var src = (existing && existing.getAttribute('src')) || (window.BANORTE_VCE ? window.BANORTE_VCE.lightboxSrc : null);
-        if (!src) return;
-        if (!document.getElementById('banorte-lightbox-fallback')) {
-          var s = document.createElement('script');
-          s.id = 'banorte-lightbox-fallback';
-          s.src = src;
-          s.setAttribute('data-cfasync','false');
-          s.setAttribute('data-no-minify','1');
-          s.setAttribute('data-no-defer','1');
-          s.async = false;
-          s.defer = false;
-          (document.head || document.documentElement).appendChild(s);
-          log('Fallback inyectado:', src);
-          injected = true;
-        }
-      }
-
-      (function tick(){
-        if (ready()){
-          try {
-            if (typeof window.Payment.setEnv === 'function') {
-              window.Payment.setEnv('pro'); // Banorte: siempre 'pro'
-              log('Payment.setEnv: pro');
-            }
-          } catch(e){ log('setEnv error', e); }
-          return resolve(true);
-        }
-        if (!injected) inject();
-        if (Date.now() - start > timeoutMs) {
-          return reject(new Error('Lightbox no disponible'));
-        }
-        setTimeout(tick, 150);
+      (function poll(){
+        if (checkFn()) return resolve(label || 'ok');
+        if (Date.now() - started > timeoutMs) return reject(new Error('Timeout waiting for ' + (label || 'condition')));
+        setTimeout(poll, 120);
       })();
     });
   }
 
-  // Fallback: crear modal simple e inyectar iframe + POST del token a /orquestador/V2
-  function openFallbackV2(token){
-    var modal = document.getElementById('banorte-vce-modal');
-    if (!modal){
-      modal = document.createElement('div');
-      modal.id = 'banorte-vce-modal';
-      modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:999999;display:flex;align-items:center;justify-content:center;padding:2%';
-      modal.innerHTML =
-        '<div style="background:#fff;width:100%;max-width:720px;min-height:520px;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.3);position:relative;">' +
-          '<button id="banorte-vce-close" style="position:absolute;right:10px;top:10px;border:0;background:#eee;border-radius:8px;padding:6px 10px;cursor:pointer">Cerrar</button>' +
-          '<iframe id="banorte-vce-frame" name="banorte-vce-frame" style="width:100%;height:100%;border:0;border-radius:12px;"></iframe>' +
-        '</div>';
-      document.body.appendChild(modal);
-      modal.querySelector('#banorte-vce-close').onclick = function(){ modal.remove(); };
-    }
-    var iframe = document.getElementById('banorte-vce-frame');
-
-    // POST (token) -> /orquestador/V2 dentro del iframe
-    var form = document.createElement('form');
-    form.style.display = 'none';
-    form.target = 'banorte-vce-frame';
-    form.method = 'POST';
-    form.action = 'https://multicobros.banorte.com/orquestador/V2';
-
-    var input = document.createElement('input');
-    input.type = 'hidden';
-    input.name = 'token';
-    input.value = token;
-    form.appendChild(input);
-
-    document.body.appendChild(form);
-    form.submit();
-    form.remove();
-
-    log('Fallback modal abierto.');
+  function callEncrypt(ajaxUrl){
+    if (!ajaxUrl) return Promise.reject(new Error('Missing AJAX URL'));
+    log('Encrypt ->', ajaxUrl);
+    return fetch(ajaxUrl, { credentials: 'same-origin' })
+      .then(function(r){
+        return r.text().then(function(t){
+          var status = r.status;
+          var data;
+          try { data = JSON.parse(t); } catch(e) { data = null; }
+          if (!r.ok) {
+            var msg = (data && data.data && (data.data.msg || data.data.error)) || (t && t.trim()) || ('HTTP ' + status);
+            if (msg === '0') { msg = 'Ajax action no registrada o plugin no cargado'; }
+            if (data && data.data && typeof data.data.code !== 'undefined') { msg += ' (code ' + data.data.code + ')'; }
+            if (data && data.data && data.data.err) { msg += ' - ' + data.data.err; }
+            throw new Error(msg);
+          }
+          return data;
+        });
+      })
+      .then(function(data){
+        if (!data || data.success !== true) {
+          var m = (data && data.data && (data.data.msg || data.data.error)) || 'Unknown error';
+          throw new Error(m);
+        }
+        log('Encrypt OK');
+        return data.data; // {mode,sub1,sub2} or {token,post_url}
+      });
   }
 
-  // Exponemos una función global que TU flujo llamará cuando ya tengas Params
-  // (cifrado vía wsCifrado + authenticateV2 al token)
-  window.BanorteStartPayment = async function(paramsString, opts){
-    opts = opts || {};
-    log('Llamando BanorteStartPayment...');
-    try {
-      await ensurePaymentReady(15000);
-      log('Payment listo, abriendo lightbox...');
-      window.Payment.startPayment({
-        Params: paramsString,
-        onSuccess: opts.onSuccess || function(resp){
-          log('VCE onSuccess:', resp);
-          var nc = (resp && (resp.numeroControl || resp.controlNumber)) || '';
-          window.location = (opts.successUrl || (window.location.origin + '/?banorte=ok')) + '&control=' + encodeURIComponent(nc);
-        },
-        onError: opts.onError || function(resp){
-          log('VCE onError:', resp);
-          alert('Error en el pago.\n' + JSON.stringify(resp, null, 2));
-          window.location = (opts.errorUrl || (window.location.origin + '/?banorte=err'));
-        },
-        onCancel: opts.onCancel || function(){
-          log('VCE onCancel');
-          window.location = (opts.cancelUrl || (window.location.origin + '/?banorte=cancel'));
-        },
-        onClosed: function(){ log('VCE onClosed'); }
-      });
-    } catch(e){
-      // Si el lightbox sigue sin aparecer, como último recurso prueba el fallback por token
-      log('Lightbox no disponible, usando fallback. Motivo:', e && e.message);
-      if (opts && opts.token) {
-        openFallbackV2(opts.token);
-      } else {
-        alert('No se pudo iniciar el pago: Lightbox no disponible.');
+  function startSession(cfg){
+    cfg = cfg || {};
+    return new Promise(function(resolve){
+      function tryStart(){
+        try {
+          if (window.Payment && typeof window.Payment.startPaymentV2 === 'function') {
+            log('Calling Payment.startPaymentV2', {mode: cfg.mode});
+            var r = window.Payment.startPaymentV2(cfg);
+            if (r && typeof r.then === 'function') return r.then(function(){ resolve('ok'); }).catch(function(){ resolve('ok'); });
+            return resolve('ok');
+          }
+          if (window.Payment && typeof window.Payment.startPayment === 'function') {
+            log('Calling Payment.startPayment (object|args)', {mode: cfg.mode});
+            try {
+              var r1 = window.Payment.startPayment(cfg);
+              if (r1 && typeof r1.then === 'function') return r1.then(function(){ resolve('ok'); }).catch(function(){ resolve('ok'); });
+              return resolve('ok');
+            } catch(e1){
+              try {
+                var r2 = window.Payment.startPayment(cfg.user, cfg.password, cfg.affiliateId, cfg.terminalId, cfg.merchantName, cfg.merchantCity, cfg.lang, cfg.mode);
+                if (r2 && typeof r2.then === 'function') return r2.then(function(){ resolve('ok'); }).catch(function(){ resolve('ok'); });
+                return resolve('ok');
+              } catch(e2){
+                // fallthrough to configure
+              }
+            }
+          }
+          if (window.Payment && typeof window.Payment.configure === 'function') {
+            log('Calling Payment.configure', {mode: cfg.mode});
+            try { window.Payment.configure(cfg); } catch(e3){}
+            return resolve('ok');
+          }
+        } catch(e){}
+        // If we reached here, not ready yet
+        setTimeout(tryStart, 150);
       }
+      tryStart();
+    });
+  }
+
+  function startLightbox(resp, okUrl, cancelUrl){
+    if (!resp) throw new Error('Empty response');
+    // token/post fallback
+    if (resp.mode === 'token_post' && resp.post_url && resp.token) {
+      log('Mode token_post -> submit form');
+      var form = document.createElement('form');
+      form.method = 'POST';
+      form.action = resp.post_url;
+      form.style.display = 'none';
+      var input = document.createElement('input');
+      input.type = 'hidden'; input.name = 'token'; input.value = resp.token;
+      form.appendChild(input);
+      document.body.appendChild(form);
+      form.submit();
+      return;
     }
-  };
+    // sub1/sub2
+    if (resp.mode === 'sub1sub2') {
+      var sub1 = resp.sub1 || ''; var sub2 = resp.sub2 || '';
+      if (!sub1 || !sub2) throw new Error('Missing sub1/sub2');
+      log('Launching authenticateV2');
+      try {
+        window.Payment.authenticateV2({
+          llave: sub1,
+          data: sub2,
+          onResult: function(result){
+            log('VCE result:', result);
+            try { sessionStorage.setItem('banorte_vce_result', JSON.stringify(result)); } catch(e){}
+            if (result && result.status === 'A') {
+              window.location.href = okUrl;
+            } else {
+              window.location.href = cancelUrl;
+            }
+          }
+        });
+      } catch(e){
+        err('authenticateV2 failed', e);
+        alert('No se pudo iniciar el pago. Intenta de nuevo.');
+        window.location.href = cancelUrl;
+      }
+      return;
+    }
+    throw new Error('Unexpected mode: ' + resp.mode);
+  }
 
-  // Diagnóstico inicial
-  window.addEventListener('load', function(){
-    log('Payment:', typeof window.Payment, 'startPayment:', (window.Payment ? typeof window.Payment.startPayment : 'n/a'));
+  document.addEventListener('DOMContentLoaded', function(){
+    var node = document.getElementById('banorte-vce-bootstrap');
+    if (!node) return;
+
+    var ajaxUrl   = node.getAttribute('data-ajax')   || '';
+    var okUrl     = node.getAttribute('data-done')   || '/';
+    var cancelUrl = node.getAttribute('data-cancel') || '/';
+    var lightboxSrc = node.getAttribute('data-lb')   || (window.endpointJs || '');
+    var startCfg  = window.BANORTE_VCE_STARTCFG || {};
+    if (!startCfg.mode) { startCfg.mode = (node.getAttribute('data-mode') || 'PRD'); }
+
+    log('checkoutV2.js tags (initial):', document.querySelectorAll("script[src*='checkoutV2.js']").length, 'mode:', startCfg.mode);
+
+    // Kick off:
+    // 1) Wait until Payment object exists (not authenticateV2), then start session ASAP.
+    // 2) In parallel, call encrypt.
+    // 3) After session started, wait specifically for authenticateV2.
+    var pPaymentObj = waitUntil(hasPayment, MAX_WAIT_MS, 'Payment object');
+    var pSession    = pPaymentObj.then(function(){ return startSession(startCfg); });
+    var pEncrypt    = callEncrypt(ajaxUrl);
+
+    pSession
+      .then(function(){ log('Session ready'); return waitUntil(hasAuth, MAX_WAIT_MS, 'Payment.authenticateV2'); })
+      .then(function(){ return pEncrypt; })
+      .then(function(resp){ startLightbox(resp, okUrl, cancelUrl); })
+      .catch(function(e){
+        err('Bootstrap VCE error:', e && e.message ? e.message : e);
+        alert('No se pudo cargar el sistema de pago.');
+        window.location.href = cancelUrl;
+      });
   });
-
-})(jQuery);
+})();
