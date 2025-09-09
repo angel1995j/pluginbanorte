@@ -1,0 +1,43 @@
+/* Estilos para la administración de Banorte */
+.banorte-test-fields,
+.banorte-production-fields {
+    padding: 15px;
+    border-left: 4px solid #f0ad4e;
+    background: #fff8e5;
+    margin: 10px 0;
+}
+
+.banorte-production-fields {
+    border-left-color: #5cb85c;
+    background: #eaffea;
+}
+
+.banorte-field-group {
+    margin-bottom: 15px;
+}
+
+.banorte-field-group label {
+    display: block;
+    margin-bottom: 5px;
+    font-weight: bold;
+}
+
+.banorte-field-group input[type="text"],
+.banorte-field-group input[type="password"],
+.banorte-field-group textarea {
+    width: 100%;
+    max-width: 400px;
+    padding: 8px;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+}
+
+.banorte-help-text {
+    color: #666;
+    font-size: 12px;
+    margin-top: 5px;
+}
+
+.banorte-required {
+    color: #d9534f;
+}
